@@ -24,7 +24,6 @@ interface ISwitchboard {
     function createRandomness(bytes32 randomnessId, uint64 minSettlementDelay) external returns (address oracle);
     function settleRandomness(bytes calldata encodedRandomness) external payable;
     function getRandomness(bytes32 randomnessId) external view returns (RandomnessData memory);
-    function updateFee() external view returns (uint256);
 }
 
 contract R3tardsRaffle is IERC721Receiver {
@@ -211,32 +210,31 @@ contract R3tardsRaffle is IERC721Receiver {
             abi.encodePacked(block.number, block.timestamp, msg.sender, address(this))
         );
 
-        uint256 fee = switchboard.updateFee();
         address oracle = switchboard.createRandomness(randId, MIN_SETTLEMENT_DELAY);
-        ISwitchboard.RandomnessData memory data = switchboard.getRandomness(randId);
 
-        randomnessId           = randId;
-        drawOracle             = oracle != address(0) ? oracle : data.oracle;
+        randomnessId   = randId;
+        drawOracle     = oracle;
+        drawRequestFee = 0;
+        state          = State.DrawRequested;
+
+        emit DrawRequested(randomnessId, drawOracle, 0, MIN_SETTLEMENT_DELAY, 0);
+    }
+
+    // Call this after requestDraw() to cache rollTimestamp and oracle from Switchboard
+    function fetchDrawData() external onlyOwner {
+        if (state != State.DrawRequested) revert WrongState(state);
+
+        ISwitchboard.RandomnessData memory data = switchboard.getRandomness(randomnessId);
+
+        if (data.oracle != address(0)) drawOracle = data.oracle;
         drawRollTimestamp      = data.rollTimestamp;
         drawMinSettlementDelay = data.minSettlementDelay;
-        drawRequestFee         = fee;
-
-        state = State.DrawRequested;
-
-        emit DrawRequested(
-            randomnessId,
-            drawOracle,
-            drawRollTimestamp,
-            drawMinSettlementDelay,
-            drawRequestFee
-        );
     }
 
     function fulfillDraw(bytes calldata encodedRandomness) external payable {
         if (state != State.DrawRequested) revert WrongState(state);
 
-        uint256 fee = switchboard.updateFee();
-        if (msg.value < fee) revert InsufficientFee(msg.value, fee);
+        uint256 fee = 0; // fee is 0 on Switchboard Monad
 
         try switchboard.settleRandomness{value: fee}(encodedRandomness) {
             // settlement succeeded
@@ -331,7 +329,7 @@ contract R3tardsRaffle is IERC721Receiver {
             drawOracle,
             drawRollTimestamp,
             drawMinSettlementDelay,
-            switchboard.updateFee()
+            0 // fee is 0 on Switchboard Monad
         );
     }
 
@@ -354,13 +352,7 @@ contract R3tardsRaffle is IERC721Receiver {
         bytes32 _snapshotHash,
         address _prizeNFT,
         uint256 _prizeTokenId,
-        uint256 _drawDeadline,
-        State _state,
-        bytes32 _randomnessId,
-        address _winner,
-        uint256 _winningTicket,
-        bool _prizeDeposited,
-        bool _prizeClaimed
+        uint256 _drawDeadline
     ) {
         return (
             totalTickets,
@@ -369,7 +361,19 @@ contract R3tardsRaffle is IERC721Receiver {
             snapshotHash,
             prizeNFT,
             prizeTokenId,
-            drawDeadline,
+            drawDeadline
+        );
+    }
+
+    function getRaffleState() external view returns (
+        State _state,
+        bytes32 _randomnessId,
+        address _winner,
+        uint256 _winningTicket,
+        bool _prizeDeposited,
+        bool _prizeClaimed
+    ) {
+        return (
             state,
             randomnessId,
             winner,
@@ -379,8 +383,8 @@ contract R3tardsRaffle is IERC721Receiver {
         );
     }
 
-    function getRequiredFee() external view returns (uint256) {
-        return switchboard.updateFee();
+    function getRequiredFee() external pure returns (uint256) {
+        return 0; // fee is 0 on Switchboard Monad
     }
 
     receive() external payable {}
