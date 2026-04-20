@@ -23,7 +23,7 @@ const NETWORK  = process.argv.includes('--network') ? process.argv[process.argv.
 const CHAIN_ID = NETWORK === 'mainnet' ? '143' : '10143';
 const SWITCHBOARD = NETWORK === 'mainnet'
   ? '0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67'
-  : '0xD3860E2C66cBd5c969Fa7343e6912Eff0416bA33'; // official Monad testnet (Diamond)
+  : '0x6724818814927e057a693f4e3A172b6cC1eA690C'; // confirmed Monad testnet
 const RPC_URL = NETWORK === 'mainnet'
   ? 'https://rpc.monad.xyz'
   : 'https://testnet-rpc.monad.xyz';
