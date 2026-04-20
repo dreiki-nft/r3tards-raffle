@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 /**
  * @title R3tardsRaffle
  * @notice Verifiable onchain raffle for r3tards NFT holders on Monad.
- *         Randomness provided by Switchboard VRF via TEE-secured oracles.
+ *         Randomness provided by Pyth Entropy via callback pattern.
  *
  * Flow:
  *   1. initSnapshot(snapshotBlock, snapshotHash)
@@ -12,15 +12,13 @@ pragma solidity ^0.8.20;
  *   3. finalizeSnapshot()
  *   4. prizeNFT.safeTransferFrom(authorizedWallet, raffleAddress, tokenId)
  *   5. setDrawDeadline(blockNumber)
- *   6. requestDraw()
- *   7. Wait rollTimestamp + minSettlementDelay + buffer
- *   8. node settle-randomness.js <CONTRACT> --network mainnet
- *   9. fulfillDraw(encodedRandomness)
- *  10. claimPrize()
+ *   6. requestDraw()  — pays Pyth Entropy fee in MON, send getDrawFee() as msg.value
+ *   7. Wait for Pyth oracle callback (automatic, usually within a few blocks)
+ *   8. claimPrize()  — winner or owner triggers NFT transfer
  *
- * Switchboard:
- *   Monad Mainnet (chainId 143):   0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67
- *   Monad Testnet (chainId 10143): 0x6724818814927e057a693f4e3A172b6cC1eA690C
+ * Pyth Entropy on Monad Mainnet:
+ *   Entropy contract: 0xD458261E832415CFd3BAE5E416FdF3230ce6F134
+ *   Default provider: 0x52DeaA1c84233F7bb8C8A45baeDE41091c616506
  */
 
 interface IERC721 {
@@ -31,29 +29,32 @@ interface IERC721Receiver {
     function onERC721Received(address, address, uint256, bytes calldata) external returns (bytes4);
 }
 
-interface ISwitchboard {
-    struct RandomnessData {
-        bytes32 randId;
-        uint256 createdAt;
-        address authority;
-        uint256 rollTimestamp;
-        uint64  minSettlementDelay;
-        address oracle;
-        uint256 value;
-        uint256 settledAt;
-    }
+interface IEntropy {
+    function requestWithCallback(
+        address provider,
+        bytes32 userRandomNumber
+    ) external payable returns (uint64 sequenceNumber);
 
-    function createRandomness(bytes32 randomnessId, uint64 minSettlementDelay) external returns (address oracle);
-    function settleRandomness(bytes calldata encodedRandomness) external payable;
-    function getRandomness(bytes32 randomnessId) external view returns (RandomnessData memory);
+    function getFee(address provider) external view returns (uint128 fee);
 }
 
-contract R3tardsRaffle is IERC721Receiver {
+interface IEntropyConsumer {
+    function entropyCallback(
+        uint64 sequenceNumber,
+        address provider,
+        bytes32 randomNumber
+    ) external;
+}
+
+contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
 
     // ─── Constants ────────────────────────────────────────────────────────────
 
-    /// @notice Switchboard minimum settlement delay in seconds
-    uint64 public constant MIN_SETTLEMENT_DELAY = 5;
+    /// @notice Pyth Entropy contract on Monad Mainnet
+    address public constant ENTROPY_CONTRACT = 0xD458261E832415CFd3BAE5E416FdF3230ce6F134;
+
+    /// @notice Pyth default provider on Monad Mainnet
+    address public constant ENTROPY_PROVIDER = 0x52DeaA1c84233F7bb8C8A45baeDE41091c616506;
 
     /// @notice Team wallets — cannot deposit prize OR win
     address public constant DEPLOYER           = 0x40Ea55E0b8f02f8eBc9D91e082e202ed988647fA;
@@ -65,8 +66,7 @@ contract R3tardsRaffle is IERC721Receiver {
     // ─── Immutables ───────────────────────────────────────────────────────────
 
     address public immutable owner;
-    ISwitchboard public immutable switchboard;
-    address public immutable switchboardAddress;
+    IEntropy public immutable entropy;
 
     // ─── Snapshot state ───────────────────────────────────────────────────────
 
@@ -80,7 +80,7 @@ contract R3tardsRaffle is IERC721Receiver {
 
     address public prizeNFT;
     uint256 public prizeTokenId;
-    address public prizeDepositor;   // who deposited — NFT returns here on recovery
+    address public prizeDepositor;
     bool    public prizeDeposited;
     bool    public prizeClaimed;
 
@@ -89,8 +89,7 @@ contract R3tardsRaffle is IERC721Receiver {
     enum State { Pending, LoadingSnapshot, SnapshotLoaded, PrizeDeposited, DrawRequested, Complete }
     State public state;
 
-    uint256 private _drawNonce;      // ensures unique randomnessId across retries
-    bytes32 public randomnessId;
+    uint64  public sequenceNumber;   // Pyth Entropy sequence number for pending draw
     uint256 public drawDeadline;
     address public winner;
     uint256 public winningTicket;
@@ -101,8 +100,8 @@ contract R3tardsRaffle is IERC721Receiver {
     event SnapshotFinalized(uint256 walletCount, uint256 totalTickets, uint256 snapshotBlock, bytes32 snapshotHash);
     event PrizeDeposited(address indexed depositor, address indexed nft, uint256 tokenId);
     event DrawDeadlineSet(uint256 blockNumber);
-    event DrawRequested(bytes32 indexed randomnessId, uint64 minSettlementDelay);
-    event DrawComplete(address indexed winner, uint256 winningTicket, uint256 totalTickets, bytes32 indexed randomnessId, uint256 randomnessValue);
+    event DrawRequested(uint64 indexed sequenceNumber, bytes32 userRandomNumber, uint256 feePaid);
+    event DrawComplete(address indexed winner, uint256 winningTicket, uint256 totalTickets, bytes32 randomNumber);
     event PrizeClaimed(address indexed winner, address indexed nft, uint256 tokenId);
     event PrizeRecovered(address indexed to, address indexed nft, uint256 tokenId);
 
@@ -110,27 +109,25 @@ contract R3tardsRaffle is IERC721Receiver {
 
     error NotOwner();
     error NotWinnerOrOwner();
+    error NotEntropyContract();
     error WrongState(State current);
     error InvalidSnapshot();
+    error InsufficientFee(uint256 sent, uint256 required);
     error RandomnessNotResolved();
     error DeadlinePassed(uint256 current, uint256 deadline);
     error DeadlineNotSet();
     error PrizeAlreadyClaimed();
     error PrizeNotDeposited();
-    error RandomnessIdMismatch(bytes32 expected, bytes32 actual);
-    error SettlementFailedString(string reason);
-    error SettlementFailedBytes(bytes reason);
     error NoEligibleWinner();
+    error NotAuthorizedDepositor();
     error ZeroTicketEntry();
 
     // ─── Constructor ──────────────────────────────────────────────────────────
 
-    constructor(address _switchboard) {
-        require(_switchboard != address(0), "Invalid Switchboard address");
-        owner              = msg.sender;
-        switchboard        = ISwitchboard(_switchboard);
-        switchboardAddress = _switchboard;
-        state              = State.Pending;
+    constructor() {
+        owner   = msg.sender;
+        entropy = IEntropy(ENTROPY_CONTRACT);
+        state   = State.Pending;
     }
 
     // ─── Modifiers ────────────────────────────────────────────────────────────
@@ -147,7 +144,6 @@ contract R3tardsRaffle is IERC721Receiver {
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
-    /// @dev Returns true if addr is a team wallet (authorized depositor AND winner blacklist)
     function _isTeamWallet(address addr) internal pure returns (bool) {
         return addr == DEPLOYER
             || addr == COMMUNITY_TREASURY
@@ -172,11 +168,10 @@ contract R3tardsRaffle is IERC721Receiver {
         prizeDepositor = address(0);
         prizeDeposited = false;
         prizeClaimed   = false;
-        randomnessId   = bytes32(0);
+        sequenceNumber = 0;
         drawDeadline   = 0;
         winner         = address(0);
         winningTicket  = 0;
-        // _drawNonce intentionally NOT reset — prevents randomnessId reuse across raffles
 
         state = State.LoadingSnapshot;
     }
@@ -211,12 +206,6 @@ contract R3tardsRaffle is IERC721Receiver {
 
     // ─── Step 2: Deposit prize NFT ────────────────────────────────────────────
 
-    /**
-     * @notice Triggered automatically when a team wallet sends the prize NFT here.
-     *         Call: prizeNFT.safeTransferFrom(teamWallet, raffleAddress, tokenId)
-     *         Only team wallets (DEPLOYER, COMMUNITY_TREASURY, ACTIVATION, PARTNERS, TEAM_LOCK)
-     *         are authorized to deposit.
-     */
     function onERC721Received(
         address,
         address from,
@@ -249,57 +238,59 @@ contract R3tardsRaffle is IERC721Receiver {
 
     // ─── Step 4: Request randomness ───────────────────────────────────────────
 
-    function requestDraw() external onlyOwner {
+    /**
+     * @notice Request randomness from Pyth Entropy. Send getDrawFee() as msg.value.
+     * @param userRandomNumber A random bytes32 you generate off-chain for added entropy.
+     *        Use: ethers.randomBytes(32) or any random hex bytes32.
+     */
+    function requestDraw(bytes32 userRandomNumber) external payable onlyOwner {
         if (state != State.PrizeDeposited) revert WrongState(state);
         if (drawDeadline == 0) revert DeadlineNotSet();
         if (block.number > drawDeadline) revert DeadlinePassed(block.number, drawDeadline);
 
-        bytes32 randId = keccak256(
-            abi.encodePacked(block.number, block.timestamp, msg.sender, address(this), _drawNonce++)
-        );
+        uint128 fee = entropy.getFee(ENTROPY_PROVIDER);
+        if (msg.value < fee) revert InsufficientFee(msg.value, fee);
 
-        switchboard.createRandomness(randId, MIN_SETTLEMENT_DELAY);
+        uint64 seq = entropy.requestWithCallback{value: fee}(ENTROPY_PROVIDER, userRandomNumber);
 
-        randomnessId = randId;
-        state        = State.DrawRequested;
+        sequenceNumber = seq;
+        state          = State.DrawRequested;
 
-        emit DrawRequested(randId, MIN_SETTLEMENT_DELAY);
+        emit DrawRequested(seq, userRandomNumber, fee);
+
+        // Refund excess MON
+        uint256 excess = msg.value - fee;
+        if (excess > 0) {
+            (bool ok,) = msg.sender.call{value: excess}("");
+            if (!ok) { /* non-critical, excess stays in contract */ }
+        }
     }
 
-    // ─── Step 5: Fulfill draw ─────────────────────────────────────────────────
+    // ─── Step 5: Pyth callback (automatic) ───────────────────────────────────
 
     /**
-     * @notice Settle the raffle with the Switchboard oracle response.
-     *         Anyone can call this — permissionless settlement.
-     *         Get encodedRandomness by running: node settle-randomness.js <CONTRACT> --network mainnet
+     * @notice Called automatically by Pyth Entropy oracle with the verified random number.
+     *         Do NOT call this directly — it will revert if not called from the Entropy contract.
      */
-    function fulfillDraw(bytes calldata encodedRandomness) external {
+    function entropyCallback(
+        uint64 _sequenceNumber,
+        address, /* provider */
+        bytes32 randomNumber
+    ) external override {
+        if (msg.sender != ENTROPY_CONTRACT) revert NotEntropyContract();
         if (state != State.DrawRequested) revert WrongState(state);
-
-        try switchboard.settleRandomness(encodedRandomness) {
-            // settled
-        } catch Error(string memory reason) {
-            revert SettlementFailedString(reason);
-        } catch (bytes memory reason) {
-            revert SettlementFailedBytes(reason);
-        }
-
-        ISwitchboard.RandomnessData memory data = switchboard.getRandomness(randomnessId);
-
-        if (data.randId != randomnessId) revert RandomnessIdMismatch(randomnessId, data.randId);
-        if (data.settledAt == 0) revert RandomnessNotResolved();
+        if (_sequenceNumber != sequenceNumber) revert RandomnessNotResolved();
         if (totalTickets == 0) revert InvalidSnapshot();
 
-        winningTicket = data.value % totalTickets;
+        winningTicket = uint256(randomNumber) % totalTickets;
         winner        = _findWinner(winningTicket);
         state         = State.Complete;
 
-        emit DrawComplete(winner, winningTicket, totalTickets, randomnessId, data.value);
+        emit DrawComplete(winner, winningTicket, totalTickets, randomNumber);
     }
 
     // ─── Step 6: Claim prize ──────────────────────────────────────────────────
 
-    /// @notice Winner or owner triggers NFT transfer to winner.
     function claimPrize() external onlyWinnerOrOwner {
         if (state != State.Complete) revert WrongState(state);
         if (!prizeDeposited) revert PrizeNotDeposited();
@@ -314,8 +305,6 @@ contract R3tardsRaffle is IERC721Receiver {
 
     // ─── Emergency ────────────────────────────────────────────────────────────
 
-    /// @notice Recover prize NFT if raffle needs to be cancelled.
-    ///         Returns NFT to original depositor. Resets to SnapshotLoaded state.
     function recoverPrize() external onlyOwner {
         if (state == State.Complete) revert WrongState(state);
         if (!prizeDeposited) revert PrizeNotDeposited();
@@ -329,7 +318,7 @@ contract R3tardsRaffle is IERC721Receiver {
         prizeNFT       = address(0);
         prizeTokenId   = 0;
         prizeDepositor = address(0);
-        randomnessId   = bytes32(0);
+        sequenceNumber = 0;
         drawDeadline   = 0;
 
         state = State.SnapshotLoaded;
@@ -340,8 +329,6 @@ contract R3tardsRaffle is IERC721Receiver {
 
     // ─── Internal ─────────────────────────────────────────────────────────────
 
-    /// @dev Binary search + blacklist skip. If draw lands on a team wallet,
-    ///      walks forward to next eligible holder.
     function _findWinner(uint256 ticketIndex) internal view returns (address) {
         uint256 lo = 0;
         uint256 hi = cumTickets.length - 1;
@@ -368,25 +355,9 @@ contract R3tardsRaffle is IERC721Receiver {
 
     // ─── Views ────────────────────────────────────────────────────────────────
 
-    /// @notice Returns Switchboard resolver params needed for Crossbar.
-    ///         Call after requestDraw() to get oracle, rollTimestamp, minSettlementDelay.
-    function getResolverParams() external view returns (
-        uint256 chainId,
-        bytes32 _randomnessId,
-        address oracle,
-        uint256 rollTimestamp,
-        uint64  minSettlementDelay,
-        uint256 fee
-    ) {
-        ISwitchboard.RandomnessData memory data = switchboard.getRandomness(randomnessId);
-        return (
-            block.chainid,
-            randomnessId,
-            data.oracle,
-            data.rollTimestamp,
-            data.minSettlementDelay,
-            0 // fee is 0 on Switchboard Monad
-        );
+    /// @notice Returns the MON fee required to call requestDraw(). Send this as msg.value.
+    function getDrawFee() external view returns (uint128) {
+        return entropy.getFee(ENTROPY_PROVIDER);
     }
 
     /// @notice Snapshot + prize + deadline info
@@ -415,7 +386,7 @@ contract R3tardsRaffle is IERC721Receiver {
     /// @notice Draw + winner state
     function getRaffleState() external view returns (
         State   _state,
-        bytes32 _randomnessId,
+        uint64  _sequenceNumber,
         address _winner,
         uint256 _winningTicket,
         bool    _prizeDeposited,
@@ -423,7 +394,7 @@ contract R3tardsRaffle is IERC721Receiver {
     ) {
         return (
             state,
-            randomnessId,
+            sequenceNumber,
             winner,
             winningTicket,
             prizeDeposited,
@@ -442,11 +413,6 @@ contract R3tardsRaffle is IERC721Receiver {
             }
         }
         return (0, 0, false);
-    }
-
-    /// @notice Fee is always 0 on Switchboard Monad
-    function getRequiredFee() external pure returns (uint256) {
-        return 0;
     }
 
     receive() external payable {}
