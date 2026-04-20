@@ -34,16 +34,6 @@ interface IEntropy {
         address provider,
         bytes32 userRandomNumber
     ) external payable returns (uint64 sequenceNumber);
-
-    function requestWithCallbackAndGasLimit(
-        address provider,
-        bytes32 userRandomNumber,
-        uint32 gasLimit
-    ) external payable returns (uint64 sequenceNumber);
-
-    function getFee(address provider) external view returns (uint128 fee);
-
-    function getFeeV2(address provider, uint32 gasLimit) external view returns (uint128 fee);
 }
 
 interface IEntropyConsumer {
@@ -100,10 +90,11 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
 
     // ─── Draw state ───────────────────────────────────────────────────────────
 
-    enum State { Pending, LoadingSnapshot, SnapshotLoaded, PrizeDeposited, DrawRequested, Complete }
+    enum State { Pending, LoadingSnapshot, SnapshotLoaded, PrizeDeposited, DrawRequested, RandomnessReceived, Complete }
     State public state;
 
-    uint64  public sequenceNumber;   // Pyth Entropy sequence number for pending draw
+    uint64  public sequenceNumber;
+    bytes32 public rawRandomNumber;  // stored by callback, used by fulfillDraw
     uint256 public drawDeadline;
     address public winner;
     uint256 public winningTicket;
@@ -126,7 +117,6 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
     error NotEntropyContract();
     error WrongState(State current);
     error InvalidSnapshot();
-    error InsufficientFee(uint256 sent, uint256 required);
     error RandomnessNotResolved();
     error DeadlinePassed(uint256 current, uint256 deadline);
     error DeadlineNotSet();
@@ -262,36 +252,25 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
         if (drawDeadline == 0) revert DeadlineNotSet();
         if (block.number > drawDeadline) revert DeadlinePassed(block.number, drawDeadline);
 
-        uint128 fee = entropy.getFeeV2(ENTROPY_PROVIDER, CALLBACK_GAS_LIMIT);
-        if (msg.value < fee) revert InsufficientFee(msg.value, fee);
-
-        uint64 seq = entropy.requestWithCallbackAndGasLimit{value: fee}(ENTROPY_PROVIDER, userRandomNumber, CALLBACK_GAS_LIMIT);
+        uint64 seq = entropy.requestWithCallback{value: msg.value}(ENTROPY_PROVIDER, userRandomNumber);
 
         sequenceNumber = seq;
         state          = State.DrawRequested;
 
-        emit DrawRequested(seq, userRandomNumber, fee);
-
-        // Refund excess MON
-        uint256 excess = msg.value - fee;
-        if (excess > 0) {
-            (bool ok,) = msg.sender.call{value: excess}("");
-            if (!ok) { /* non-critical, excess stays in contract */ }
-        }
+        emit DrawRequested(seq, userRandomNumber, msg.value);
     }
 
     // ─── Pyth required ────────────────────────────────────────────────────────
 
-    /// @notice Required by IEntropyConsumer — returns Entropy contract address
     function getEntropy() external pure override returns (address) {
         return ENTROPY_CONTRACT;
     }
 
-    // ─── Step 5: Pyth callback (automatic) ───────────────────────────────────
+    // ─── Step 5a: Pyth callback — just stores randomness (cheap) ─────────────
 
     /**
-     * @notice Called automatically by Pyth Entropy oracle with the verified random number.
-     *         Do NOT call this directly — it will revert if not called from the Entropy contract.
+     * @notice Called automatically by Pyth oracle. Stores the random number onchain.
+     *         Intentionally cheap — winner selection happens in fulfillDraw().
      */
     function _entropyCallback(
         uint64 _sequenceNumber,
@@ -301,13 +280,28 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
         if (msg.sender != ENTROPY_CONTRACT) revert NotEntropyContract();
         if (state != State.DrawRequested) revert WrongState(state);
         if (_sequenceNumber != sequenceNumber) revert RandomnessNotResolved();
+
+        rawRandomNumber = randomNumber;
+        state           = State.RandomnessReceived;
+
+        emit DrawComplete(address(0), 0, totalTickets, randomNumber);
+    }
+
+    // ─── Step 5b: fulfillDraw — picks winner from stored randomness ───────────
+
+    /**
+     * @notice Call this after the Pyth callback fires (state = RandomnessReceived).
+     *         Runs _findWinner and sets the winner. Anyone can call.
+     */
+    function fulfillDraw() external {
+        if (state != State.RandomnessReceived) revert WrongState(state);
         if (totalTickets == 0) revert InvalidSnapshot();
 
-        winningTicket = uint256(randomNumber) % totalTickets;
+        winningTicket = uint256(rawRandomNumber) % totalTickets;
         winner        = _findWinner(winningTicket);
         state         = State.Complete;
 
-        emit DrawComplete(winner, winningTicket, totalTickets, randomNumber);
+        emit DrawComplete(winner, winningTicket, totalTickets, rawRandomNumber);
     }
 
     // ─── Step 6: Claim prize ──────────────────────────────────────────────────
@@ -334,13 +328,14 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
         uint256 tid       = prizeTokenId;
         address depositor = prizeDepositor;
 
-        prizeDeposited = false;
-        prizeClaimed   = false;
-        prizeNFT       = address(0);
-        prizeTokenId   = 0;
-        prizeDepositor = address(0);
-        sequenceNumber = 0;
-        drawDeadline   = 0;
+        prizeDeposited  = false;
+        prizeClaimed    = false;
+        prizeNFT        = address(0);
+        prizeTokenId    = 0;
+        prizeDepositor  = address(0);
+        sequenceNumber  = 0;
+        rawRandomNumber = bytes32(0);
+        drawDeadline    = 0;
 
         state = State.SnapshotLoaded;
 
@@ -376,9 +371,10 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
 
     // ─── Views ────────────────────────────────────────────────────────────────
 
-    /// @notice Returns the MON fee required to call requestDraw(). Send this as msg.value.
-    function getDrawFee() external view returns (uint128) {
-        return entropy.getFeeV2(ENTROPY_PROVIDER, CALLBACK_GAS_LIMIT);
+    /// @notice Returns recommended MON fee for requestDraw(). Send this as msg.value.
+    ///         Based on empirical testing — 0.6 MON worked on Monad mainnet.
+    function getDrawFee() external pure returns (uint256) {
+        return 0.6 ether;
     }
 
     /// @notice Snapshot + prize + deadline info
@@ -408,6 +404,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
     function getRaffleState() external view returns (
         State   _state,
         uint64  _sequenceNumber,
+        bytes32 _rawRandomNumber,
         address _winner,
         uint256 _winningTicket,
         bool    _prizeDeposited,
@@ -416,6 +413,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
         return (
             state,
             sequenceNumber,
+            rawRandomNumber,
             winner,
             winningTicket,
             prizeDeposited,
