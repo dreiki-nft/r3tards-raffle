@@ -75,6 +75,8 @@ contract R3tardsRaffle is IERC721Receiver {
 
     State public state;
 
+    uint256 private _drawNonce;
+
     bytes32 public randomnessId;
     uint256 public drawDeadline;
     address public winner;
@@ -206,7 +208,7 @@ contract R3tardsRaffle is IERC721Receiver {
         if (block.number > drawDeadline) revert DeadlinePassed(block.number, drawDeadline);
 
         bytes32 randId = keccak256(
-            abi.encodePacked(block.number, block.timestamp, msg.sender, address(this))
+            abi.encodePacked(block.number, block.timestamp, msg.sender, address(this), _drawNonce++)
         );
 
         switchboard.createRandomness(randId, MIN_SETTLEMENT_DELAY);
