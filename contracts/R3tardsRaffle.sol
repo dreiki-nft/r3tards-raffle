@@ -35,15 +35,28 @@ interface IEntropy {
         bytes32 userRandomNumber
     ) external payable returns (uint64 sequenceNumber);
 
+    function requestWithCallbackAndGasLimit(
+        address provider,
+        bytes32 userRandomNumber,
+        uint32 gasLimit
+    ) external payable returns (uint64 sequenceNumber);
+
     function getFee(address provider) external view returns (uint128 fee);
+
+    function getFeeV2(address provider, uint32 gasLimit) external view returns (uint128 fee);
 }
 
 interface IEntropyConsumer {
-    function entropyCallback(
+    // Called by Pyth Entropy contract with the random number
+    // Must be internal in implementing contracts
+    function _entropyCallback(
         uint64 sequenceNumber,
         address provider,
         bytes32 randomNumber
     ) external;
+
+    // Must return the Entropy contract address
+    function getEntropy() external view returns (address);
 }
 
 contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
@@ -56,7 +69,8 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
     /// @notice Pyth default provider on Monad Mainnet
     address public constant ENTROPY_PROVIDER = 0x52DeaA1c84233F7bb8C8A45baeDE41091c616506;
 
-    /// @notice Team wallets — cannot deposit prize OR win
+    /// @notice Gas limit for Pyth callback — covers _findWinner loop for large snapshots
+    uint32 public constant CALLBACK_GAS_LIMIT = 500_000;
     address public constant DEPLOYER           = 0x40Ea55E0b8f02f8eBc9D91e082e202ed988647fA;
     address public constant COMMUNITY_TREASURY = 0xdfC19DD5f80048dF12D7a71cB01226F8ce24a954;
     address public constant ACTIVATION         = 0x18D5346216315667C51D69F346E3C768136F8018;
@@ -248,10 +262,10 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
         if (drawDeadline == 0) revert DeadlineNotSet();
         if (block.number > drawDeadline) revert DeadlinePassed(block.number, drawDeadline);
 
-        uint128 fee = entropy.getFee(ENTROPY_PROVIDER);
+        uint128 fee = entropy.getFeeV2(ENTROPY_PROVIDER, CALLBACK_GAS_LIMIT);
         if (msg.value < fee) revert InsufficientFee(msg.value, fee);
 
-        uint64 seq = entropy.requestWithCallback{value: fee}(ENTROPY_PROVIDER, userRandomNumber);
+        uint64 seq = entropy.requestWithCallbackAndGasLimit{value: fee}(ENTROPY_PROVIDER, userRandomNumber, CALLBACK_GAS_LIMIT);
 
         sequenceNumber = seq;
         state          = State.DrawRequested;
@@ -266,13 +280,20 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
         }
     }
 
+    // ─── Pyth required ────────────────────────────────────────────────────────
+
+    /// @notice Required by IEntropyConsumer — returns Entropy contract address
+    function getEntropy() external pure override returns (address) {
+        return ENTROPY_CONTRACT;
+    }
+
     // ─── Step 5: Pyth callback (automatic) ───────────────────────────────────
 
     /**
      * @notice Called automatically by Pyth Entropy oracle with the verified random number.
      *         Do NOT call this directly — it will revert if not called from the Entropy contract.
      */
-    function entropyCallback(
+    function _entropyCallback(
         uint64 _sequenceNumber,
         address, /* provider */
         bytes32 randomNumber
@@ -357,7 +378,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
 
     /// @notice Returns the MON fee required to call requestDraw(). Send this as msg.value.
     function getDrawFee() external view returns (uint128) {
-        return entropy.getFee(ENTROPY_PROVIDER);
+        return entropy.getFeeV2(ENTROPY_PROVIDER, CALLBACK_GAS_LIMIT);
     }
 
     /// @notice Snapshot + prize + deadline info
