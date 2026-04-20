@@ -22,7 +22,7 @@ pragma solidity ^0.8.20;
  *   4. Pass the encoded bytes to fulfillDraw()
  *
  * Switchboard addresses:
- *   Monad Testnet  (chainId 10143): 0x6724818814927e057a693f4e3A172b6cC1eA690C
+ *   Monad Testnet  (chainId 10143): 0xD3860E2C66cBd5c969Fa7343e6912Eff0416bA33
  *   Monad Mainnet  (chainId 143):   0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67
  */
 
@@ -117,7 +117,7 @@ contract R3tardsRaffle is IERC721Receiver {
 
     /**
      * @param _switchboard Switchboard contract address for the target network:
-     *   Testnet  (chainId 10143): 0x6724818814927e057a693f4e3A172b6cC1eA690C
+     *   Testnet  (chainId 10143): 0xD3860E2C66cBd5c969Fa7343e6912Eff0416bA33
      *   Mainnet  (chainId 143):   0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67
      */
     constructor(address _switchboard) {
