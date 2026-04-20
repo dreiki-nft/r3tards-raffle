@@ -44,7 +44,6 @@ interface ISwitchboard {
     function createRandomness(bytes32 randomnessId, uint64 minSettlementDelay) external returns (address oracle);
     function settleRandomness(bytes calldata encodedRandomness) external payable;
     function getRandomness(bytes32 randomnessId) external view returns (RandomnessData memory);
-    function updateFee() external view returns (uint256);
 }
 
 contract R3tardsRaffle is IERC721Receiver {
@@ -221,8 +220,7 @@ contract R3tardsRaffle is IERC721Receiver {
     function fulfillDraw(bytes calldata encodedRandomness) external payable {
         if (state != State.DrawRequested) revert WrongState(state);
 
-        uint256 fee = switchboard.updateFee();
-        if (msg.value < fee) revert InsufficientFee(msg.value, fee);
+        uint256 fee = 0; // Switchboard fee is 0 on Monad
 
         try switchboard.settleRandomness{value: fee}(encodedRandomness) {
             // settled
@@ -323,7 +321,7 @@ contract R3tardsRaffle is IERC721Receiver {
             data.oracle,
             data.rollTimestamp,
             data.minSettlementDelay,
-            switchboard.updateFee()
+            0 // fee is 0 on Switchboard Monad
         );
     }
 
@@ -375,8 +373,8 @@ contract R3tardsRaffle is IERC721Receiver {
         );
     }
 
-    function getRequiredFee() external view returns (uint256) {
-        return switchboard.updateFee();
+    function getRequiredFee() external pure returns (uint256) {
+        return 0; // fee is 0 on Switchboard Monad
     }
 
     receive() external payable {}
