@@ -1,45 +1,43 @@
 #!/usr/bin/env node
 /**
  * settle-randomness.js
- * Fetches randomness data from Switchboard, waits until ready,
- * then gets encoded payload from Crossbar for fulfillDraw.
+ * Reads resolver params from the raffle contract, waits until ready,
+ * fetches encoded payload from Crossbar, and prints it for fulfillDraw.
  *
  * Usage:
- *   node settle-randomness.js <RANDOMNESS_ID> [--network testnet|mainnet]
+ *   node settle-randomness.js <RAFFLE_CONTRACT_ADDRESS> [--network testnet|mainnet]
  *
  * Example (testnet):
- *   node settle-randomness.js 0x85548c76cb1fa3588cf866e3fcc380fbd1193ad70a7272db4dcdd07427effcbd
+ *   node settle-randomness.js 0xYourRaffleContract
  *
  * Example (mainnet):
- *   node settle-randomness.js 0xABC123... --network mainnet
+ *   node settle-randomness.js 0xYourRaffleContract --network mainnet
  */
 
 'use strict';
 
 const https = require('https');
 
-const RAND_ID  = process.argv[2];
-const NETWORK  = process.argv.includes('--network') ? process.argv[process.argv.indexOf('--network') + 1] : 'testnet';
-const CHAIN_ID = NETWORK === 'mainnet' ? '143' : '10143';
-const SWITCHBOARD = NETWORK === 'mainnet'
-  ? '0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67'
-  : '0x6724818814927e057a693f4e3A172b6cC1eA690C'; // confirmed Monad testnet
-const RPC_URL = NETWORK === 'mainnet'
-  ? 'https://rpc.monad.xyz'
-  : 'https://testnet-rpc.monad.xyz';
+const CONTRACT = process.argv[2];
+const NETWORK  = process.argv.includes('--network')
+  ? process.argv[process.argv.indexOf('--network') + 1]
+  : 'testnet';
+
+const CHAIN_ID    = NETWORK === 'mainnet' ? '143' : '10143';
+const RPC_URL     = NETWORK === 'mainnet' ? 'rpc.monad.xyz' : 'testnet-rpc.monad.xyz';
 const BUFFER_SECS = 15;
 
-if (!RAND_ID || !RAND_ID.startsWith('0x')) {
-  console.error('Usage: node settle-randomness.js <RANDOMNESS_ID> [--network testnet|mainnet]');
-  console.error('Example: node settle-randomness.js 0x85548c76...');
+if (!CONTRACT || !CONTRACT.startsWith('0x')) {
+  console.error('Usage: node settle-randomness.js <RAFFLE_CONTRACT_ADDRESS> [--network testnet|mainnet]');
   process.exit(1);
 }
 
+// ─── RPC ──────────────────────────────────────────────────────────────────────
 function rpcCall(method, params) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method, params });
     const req  = https.request({
-      hostname: RPC_URL.replace('https://', ''),
+      hostname: RPC_URL,
       path:     '/',
       method:   'POST',
       headers:  { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
@@ -60,6 +58,7 @@ function rpcCall(method, params) {
   });
 }
 
+// ─── Crossbar ─────────────────────────────────────────────────────────────────
 function postCrossbar(body) {
   return new Promise((resolve, reject) => {
     const bodyStr = JSON.stringify(body);
@@ -84,99 +83,102 @@ function postCrossbar(body) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function getRandomnessData(randId) {
-  // getRandomness(bytes32) — confirmed selector 0x05b19402
-  const selectors = ['05b19402'];
-  for (const sel of selectors) {
-    try {
-      const data   = '0x' + sel + randId.replace('0x', '').padStart(64, '0');
-      const result = await rpcCall('eth_call', [{ to: SWITCHBOARD, data }, 'latest']);
-      if (result && result !== '0x' && result.length > 10) {
-        const hex = result.replace('0x', '');
-        return {
-          rollTimestamp:      BigInt('0x' + hex.slice(3 * 64, 4 * 64)),
-          minSettlementDelay: BigInt('0x' + hex.slice(4 * 64, 5 * 64)),
-          oracle:             '0x' + hex.slice(5 * 64 + 24, 6 * 64),
-          value:              BigInt('0x' + hex.slice(6 * 64, 7 * 64)),
-          settledAt:          BigInt('0x' + hex.slice(7 * 64, 8 * 64)),
-        };
-      }
-    } catch(e) { /* try next */ }
+// ─── getResolverParams() ──────────────────────────────────────────────────────
+// selector: keccak256('getResolverParams()') — we'll try the known one
+async function getResolverParams() {
+  // getResolverParams() returns:
+  // uint256 chainId, bytes32 randomnessId, address oracle,
+  // uint256 rollTimestamp, uint64 minSettlementDelay, uint256 fee
+  const result = await rpcCall('eth_call', [{
+    to:   CONTRACT,
+    data: '0x6b5e4a7a' // keccak256('getResolverParams()')
+  }, 'latest']);
+
+  if (!result || result === '0x' || result.length < 10) {
+    throw new Error('getResolverParams() returned empty — wrong selector or contract not in DrawRequested state');
   }
-  throw new Error('Could not read randomness data from Switchboard contract — unknown selector');
+
+  const hex = result.replace('0x', '');
+  const slot = i => '0x' + hex.slice(i * 64, i * 64 + 64);
+
+  return {
+    chainId:            BigInt(slot(0)),
+    randomnessId:       slot(1),
+    oracle:             '0x' + hex.slice(2 * 64 + 24, 3 * 64),
+    rollTimestamp:      BigInt(slot(3)),
+    minSettlementDelay: BigInt(slot(4)),
+    fee:                BigInt(slot(5)),
+  };
 }
 
+// ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('\n╔══════════════════════════════════════════╗');
   console.log('║     r3tards — settle randomness          ║');
   console.log('╚══════════════════════════════════════════╝\n');
-  console.log(`randomnessId: ${RAND_ID}`);
-  console.log(`network:      ${NETWORK} (chainId ${CHAIN_ID})`);
-  console.log(`switchboard:  ${SWITCHBOARD}\n`);
+  console.log(`Contract: ${CONTRACT}`);
+  console.log(`Network:  ${NETWORK} (chainId ${CHAIN_ID})\n`);
 
-  // Read randomness data from Switchboard
-  console.log('Reading randomness data from Switchboard contract...');
-  let randData;
-  try {
-    randData = await getRandomnessData(RAND_ID);
-    console.log(`rollTimestamp:      ${randData.rollTimestamp}`);
-    console.log(`minSettlementDelay: ${randData.minSettlementDelay}`);
-    console.log(`oracle:             ${randData.oracle}`);
-    console.log(`settledAt:          ${randData.settledAt}`);
-    if (randData.settledAt > 0n) {
-      console.log('\n✅ Already settled! value:', randData.value.toString());
-    }
-  } catch(e) {
-    console.warn(`\n[warn] Could not read from Switchboard contract: ${e.message}`);
-    console.warn('Proceeding with timestamp=0 and no oracle (may fail)\n');
-    randData = { rollTimestamp: 0n, minSettlementDelay: 1n, oracle: null, settledAt: 0n };
+  // Step 1: Read all resolver params from contract
+  console.log('Reading resolver params from contract...');
+  const params = await getResolverParams();
+  console.log(`randomnessId:       ${params.randomnessId}`);
+  console.log(`oracle:             ${params.oracle}`);
+  console.log(`rollTimestamp:      ${params.rollTimestamp}`);
+  console.log(`minSettlementDelay: ${params.minSettlementDelay}`);
+  console.log(`fee:                ${params.fee}`);
+
+  if (params.randomnessId === '0x' + '0'.repeat(64)) {
+    console.error('\n[error] randomnessId is zero — call requestDraw() first');
+    process.exit(1);
   }
 
-  // Wait until ready
-  const readyAt  = Number(randData.rollTimestamp) + Number(randData.minSettlementDelay) + BUFFER_SECS;
+  // Step 2: Wait until rollTimestamp + minSettlementDelay + buffer
+  const readyAt  = Number(params.rollTimestamp) + Number(params.minSettlementDelay) + BUFFER_SECS;
   const nowSecs  = Math.floor(Date.now() / 1000);
   const waitSecs = Math.max(0, readyAt - nowSecs);
 
   if (waitSecs > 0) {
-    console.log(`\nWaiting ${waitSecs}s until ready...`);
+    console.log(`\nWaiting ${waitSecs}s (rollTimestamp + delay + ${BUFFER_SECS}s buffer)...`);
     for (let i = waitSecs; i > 0; i--) {
       process.stdout.write(`\r  ${i}s remaining...  `);
       await sleep(1000);
     }
     console.log('\r  Ready!              ');
   } else {
-    console.log('\nRandomness should be ready now, fetching...');
+    console.log('\nReady now, fetching from Crossbar...');
   }
 
-  // Fetch from Crossbar
-  console.log('Fetching encoded randomness from Crossbar...');
+  // Step 3: Fetch encoded payload from Crossbar
   const payload = {
-    randomness_id:         RAND_ID,
+    randomness_id:         params.randomnessId,
     network:               NETWORK,
     chain_id:              CHAIN_ID,
-    timestamp:             Number(randData.rollTimestamp),
-    min_staleness_seconds: Number(randData.minSettlementDelay),
+    timestamp:             Number(params.rollTimestamp),
+    min_staleness_seconds: Number(params.minSettlementDelay),
+    oracle:                params.oracle,
   };
-  if (randData.oracle && randData.oracle !== '0x' + '0'.repeat(40)) {
-    payload.oracle = randData.oracle;
-  }
+
+  console.log('Fetching from Crossbar with payload:');
+  console.log(JSON.stringify(payload, null, 2));
 
   const crossbar = await postCrossbar(payload);
 
   if (!crossbar.success) {
-    console.error('\n[error] Crossbar:', JSON.stringify(crossbar));
+    console.error('\n[error] Crossbar returned:', JSON.stringify(crossbar, null, 2));
     process.exit(1);
   }
 
   const encoded = crossbar.data.encoded;
+
   console.log('\n✅ SUCCESS!\n');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log('Paste into fulfillDraw() in Remix RIGHT NOW:');
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
   console.log(encoded);
   console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('\nmsg.value: 0 (fee is 0 on testnet)');
-  console.log('⚠️  Paste and call fulfillDraw immediately — payload expires!\n');
+  console.log(`\nmsg.value: ${params.fee} wei (${Number(params.fee)} MON)`);
+  console.log('⚠️  Call fulfillDraw immediately — payload expires!\n');
 }
 
 main().catch(e => {

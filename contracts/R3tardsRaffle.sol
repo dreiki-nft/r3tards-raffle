@@ -1,36 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/**
- * @title R3tardsRaffle
- * @notice Verifiable onchain raffle for r3tards NFT holders on Monad.
- *         Randomness provided by Switchboard VRF via TEE-secured oracles.
- *
- * Flow:
- *   1. initSnapshot(snapshotBlock, snapshotHash)
- *   2. loadTicketsBatch(wallets[], tickets[])  ← repeat if needed
- *   3. finalizeSnapshot()
- *   4. prizeNFT.safeTransferFrom(owner, raffleAddress, tokenId)
- *   5. setDrawDeadline(blockNumber)
- *   6. requestDraw()  [pays Switchboard fee]
- *   7. fulfillDraw(randomnessObject)  [anyone can call]
- *
- * Getting encodedRandomness after requestDraw():
- *   1. Read randomnessId from the DrawRequested event
- *   2. Call Crossbar: resolveEVMRandomness(randomnessId)
- *   3. Send updateFee() worth of MON as msg.value to fulfillDraw()
- *   4. Pass the encoded bytes to fulfillDraw()
- *
- * Switchboard addresses:
- *   Monad Testnet  (chainId 10143): 0x6724818814927e057a693f4e3A172b6cC1eA690C
- *   Monad Mainnet  (chainId 143):   0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67
- */
-
-// ─── Interfaces ───────────────────────────────────────────────────────────────
-
 interface IERC721 {
     function safeTransferFrom(address from, address to, uint256 tokenId) external;
-    function ownerOf(uint256 tokenId) external view returns (address);
 }
 
 interface IERC721Receiver {
@@ -49,83 +21,99 @@ interface ISwitchboard {
         uint256 settledAt;
     }
 
-    /// @notice Create a randomness request
     function createRandomness(bytes32 randomnessId, uint64 minSettlementDelay) external returns (address oracle);
-
-    /// @notice Settle randomness with encoded payload from Crossbar
     function settleRandomness(bytes calldata encodedRandomness) external payable;
-
-    /// @notice Read the randomness result struct
     function getRandomness(bytes32 randomnessId) external view returns (RandomnessData memory);
-
     function updateFee() external view returns (uint256);
 }
 
-// ─── Contract ─────────────────────────────────────────────────────────────────
-
 contract R3tardsRaffle is IERC721Receiver {
-
-    // ── State ──────────────────────────────────────────────────────────────────
-
     address public immutable owner;
     ISwitchboard public immutable switchboard;
-    address public immutable switchboardAddress; // stored for transparency / verification
+    address public immutable switchboardAddress;
 
-    // Snapshot
+    uint64 public constant MIN_SETTLEMENT_DELAY = 5;
+
     address[] public wallets;
-    uint256[] public cumTickets;     // cumulative ticket counts — for binary search
+    uint256[] public cumTickets;
     uint256   public totalTickets;
     uint256   public snapshotBlock;
-    bytes32   public snapshotHash;   // onchain audit anchor: keccak256 of CSV or git commit hash
+    bytes32   public snapshotHash;
 
-    // Prize
     address public prizeNFT;
     uint256 public prizeTokenId;
     bool    public prizeDeposited;
+    bool    public prizeClaimed;
 
-    // Draw
-    enum State { Pending, LoadingSnapshot, SnapshotLoaded, PrizeDeposited, DrawRequested, Complete }
+    enum State {
+        Pending,
+        LoadingSnapshot,
+        SnapshotLoaded,
+        PrizeDeposited,
+        DrawRequested,
+        Complete
+    }
+
     State public state;
 
     bytes32 public randomnessId;
-    uint256 public drawDeadline;     // block number — draw must be requested by this block
+    uint256 public drawDeadline;
     address public winner;
     uint256 public winningTicket;
 
-    // ── Events ─────────────────────────────────────────────────────────────────
+    // Switchboard resolver metadata cached at request time
+    address public drawOracle;
+    uint256 public drawRollTimestamp;
+    uint64  public drawMinSettlementDelay;
+    uint256 public drawRequestFee;
 
     event SnapshotBatchLoaded(uint256 batchSize, uint256 totalWallets, uint256 totalTicketsSoFar);
     event SnapshotFinalized(uint256 walletCount, uint256 totalTickets, uint256 snapshotBlock, bytes32 snapshotHash);
     event PrizeDeposited(address indexed nft, uint256 tokenId);
     event DrawDeadlineSet(uint256 blockNumber);
-    event DrawRequested(bytes32 indexed randomnessId, uint256 switchboardFee);
-    event DrawComplete(address indexed winner, uint256 winningTicket, uint256 totalTickets);
-    event PrizeRecovered(address indexed to);
 
-    // ── Errors ─────────────────────────────────────────────────────────────────
+    event DrawRequested(
+        bytes32 indexed randomnessId,
+        address indexed oracle,
+        uint256 rollTimestamp,
+        uint64 minSettlementDelay,
+        uint256 switchboardFee
+    );
+
+    event DrawComplete(
+        address indexed winner,
+        uint256 winningTicket,
+        uint256 totalTickets,
+        bytes32 indexed randomnessId,
+        uint256 randomnessValue
+    );
+
+    event PrizeClaimed(address indexed winner, address indexed nft, uint256 tokenId);
+    event PrizeRecovered(address indexed to);
+    event ExcessRefundFailed(address indexed to, uint256 amount);
 
     error NotOwner();
+    error NotWinnerOrOwner();
     error WrongState(State current);
     error InvalidSnapshot();
     error InsufficientFee(uint256 sent, uint256 required);
     error RandomnessNotResolved();
     error DeadlinePassed(uint256 current, uint256 deadline);
     error DeadlineNotSet();
-    error RefundFailed();
+    error PrizeAlreadyClaimed();
+    error PrizeNotDeposited();
+    error RandomnessIdMismatch(bytes32 expected, bytes32 actual);
+    error SettlementFailedString(string reason);
+    error SettlementFailedBytes(bytes reason);
 
-    // ── Constructor ────────────────────────────────────────────────────────────
-
-    /**
-     * @param _switchboard Switchboard contract address for the target network:
-     *   Testnet  (chainId 10143): 0x6724818814927e057a693f4e3A172b6cC1eA690C
-     *   Mainnet  (chainId 143):   0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67
-     */
+    // Testnet:  0x6724818814927e057a693f4e3A172b6cC1eA690C
+    // Mainnet:  0xB7F03eee7B9F56347e32cC71DaD65B303D5a0E67
     constructor(address _switchboard) {
         require(_switchboard != address(0), "Invalid Switchboard address");
-        owner             = msg.sender;
-        switchboard       = ISwitchboard(_switchboard);
+        owner              = msg.sender;
+        switchboard        = ISwitchboard(_switchboard);
         switchboardAddress = _switchboard;
-        state             = State.Pending;
+        state              = State.Pending;
     }
 
     modifier onlyOwner() {
@@ -133,36 +121,37 @@ contract R3tardsRaffle is IERC721Receiver {
         _;
     }
 
-    // ── Step 1a: Init snapshot ─────────────────────────────────────────────────
+    modifier onlyWinnerOrOwner() {
+        if (msg.sender != winner && msg.sender != owner) revert NotWinnerOrOwner();
+        _;
+    }
 
-    /**
-     * @notice Begin loading the snapshot. Clears any previous data.
-     * @param _snapshotBlock  block the snapshot was taken at (for public verification)
-     * @param _snapshotHash   keccak256 of the snapshot CSV or git commit hash
-     *                        Use: ethers.utils.id(gitCommitHash) or keccak256(csvBytes)
-     */
     function initSnapshot(uint256 _snapshotBlock, bytes32 _snapshotHash) external onlyOwner {
         if (state != State.Pending) revert WrongState(state);
 
         delete wallets;
         delete cumTickets;
-        totalTickets  = 0;
-        snapshotBlock = _snapshotBlock;
-        snapshotHash  = _snapshotHash;
-        state         = State.LoadingSnapshot;
+
+        totalTickets           = 0;
+        snapshotBlock          = _snapshotBlock;
+        snapshotHash           = _snapshotHash;
+        prizeNFT               = address(0);
+        prizeTokenId           = 0;
+        prizeDeposited         = false;
+        prizeClaimed           = false;
+        randomnessId           = bytes32(0);
+        drawDeadline           = 0;
+        winner                 = address(0);
+        winningTicket          = 0;
+        drawOracle             = address(0);
+        drawRollTimestamp      = 0;
+        drawMinSettlementDelay = 0;
+        drawRequestFee         = 0;
+
+        state = State.LoadingSnapshot;
     }
 
-    // ── Step 1b: Load batches ──────────────────────────────────────────────────
-
-    /**
-     * @notice Append wallets+tickets to the snapshot. Call once per batch.
-     *         Batching avoids block gas limit for large snapshots.
-     *         Typical safe batch size: 200–500 wallets per tx.
-     */
-    function loadTicketsBatch(
-        address[] calldata _wallets,
-        uint256[] calldata _tickets
-    ) external onlyOwner {
+    function loadTicketsBatch(address[] calldata _wallets, uint256[] calldata _tickets) external onlyOwner {
         if (state != State.LoadingSnapshot) revert WrongState(state);
         if (_wallets.length == 0 || _wallets.length != _tickets.length) revert InvalidSnapshot();
 
@@ -173,34 +162,19 @@ contract R3tardsRaffle is IERC721Receiver {
             cumulative += _tickets[i];
             cumTickets.push(cumulative);
         }
-        totalTickets = cumulative;
 
+        totalTickets = cumulative;
         emit SnapshotBatchLoaded(_wallets.length, wallets.length, totalTickets);
     }
 
-    // ── Step 1c: Finalize snapshot ─────────────────────────────────────────────
-
-    /**
-     * @notice Lock the snapshot after all batches are loaded.
-     *         After this, snapshot data cannot be modified.
-     */
     function finalizeSnapshot() external onlyOwner {
         if (state != State.LoadingSnapshot) revert WrongState(state);
-        if (wallets.length == 0) revert InvalidSnapshot();
+        if (wallets.length == 0 || totalTickets == 0) revert InvalidSnapshot();
 
         state = State.SnapshotLoaded;
         emit SnapshotFinalized(wallets.length, totalTickets, snapshotBlock, snapshotHash);
     }
 
-    // ── Step 2: Deposit prize NFT ──────────────────────────────────────────────
-
-    /**
-     * @notice Auto-triggered when owner sends prize NFT via safeTransferFrom.
-     *         Call: prizeNFT.safeTransferFrom(owner, address(this), tokenId)
-     *
-     * @dev msg.sender is the NFT contract — cannot be spoofed unlike `from`.
-     *      `from` is still checked against owner for access control.
-     */
     function onERC721Received(
         address,
         address from,
@@ -213,128 +187,124 @@ contract R3tardsRaffle is IERC721Receiver {
         prizeNFT       = msg.sender;
         prizeTokenId   = tokenId;
         prizeDeposited = true;
+        prizeClaimed   = false;
         state          = State.PrizeDeposited;
 
         emit PrizeDeposited(msg.sender, tokenId);
         return IERC721Receiver.onERC721Received.selector;
     }
 
-    // ── Step 3: Set draw deadline ──────────────────────────────────────────────
-
-    /**
-     * @notice Set the deadline block by which requestDraw() must be called.
-     *         Prevents owner from delaying the draw indefinitely.
-     *         Recommended: ~24–48h of blocks from now.
-     */
     function setDrawDeadline(uint256 _deadlineBlock) external onlyOwner {
         if (state != State.PrizeDeposited) revert WrongState(state);
         require(_deadlineBlock > block.number, "Deadline must be in the future");
+
         drawDeadline = _deadlineBlock;
         emit DrawDeadlineSet(_deadlineBlock);
     }
 
-    // ── Step 4: Request randomness ─────────────────────────────────────────────
-
-    /**
-     * @notice Pay Switchboard fee and request a verifiable random number.
-     *         Check getRequiredFee() first and send that amount as msg.value.
-     *         Excess MON is refunded automatically.
-     */
     function requestDraw() external onlyOwner {
         if (state != State.PrizeDeposited) revert WrongState(state);
         if (drawDeadline == 0) revert DeadlineNotSet();
         if (block.number > drawDeadline) revert DeadlinePassed(block.number, drawDeadline);
 
-        // Generate unique randomnessId from block data + address
-        bytes32 randId = keccak256(abi.encodePacked(block.number, block.timestamp, msg.sender, address(this)));
+        bytes32 randId = keccak256(
+            abi.encodePacked(block.number, block.timestamp, msg.sender, address(this))
+        );
 
-        // minSettlementDelay = 1 — settle after at least 1 block
-        switchboard.createRandomness(randId, 1);
-        randomnessId = randId;
-        state        = State.DrawRequested;
+        uint256 fee = switchboard.updateFee();
+        address oracle = switchboard.createRandomness(randId, MIN_SETTLEMENT_DELAY);
+        ISwitchboard.RandomnessData memory data = switchboard.getRandomness(randId);
 
-        emit DrawRequested(randomnessId, 0);
+        randomnessId           = randId;
+        drawOracle             = oracle != address(0) ? oracle : data.oracle;
+        drawRollTimestamp      = data.rollTimestamp;
+        drawMinSettlementDelay = data.minSettlementDelay;
+        drawRequestFee         = fee;
+
+        state = State.DrawRequested;
+
+        emit DrawRequested(
+            randomnessId,
+            drawOracle,
+            drawRollTimestamp,
+            drawMinSettlementDelay,
+            drawRequestFee
+        );
     }
 
-    // ── Step 5: Fulfill draw ───────────────────────────────────────────────────
-
-    /**
-     * @notice Settle the raffle with the Switchboard oracle response.
-     *         Anyone can call this — fully permissionless settlement.
-     *
-     * Steps to get encodedRandomness:
-     *   1. After requestDraw(), note the randomnessId from DrawRequested event
-     *   2. Call Crossbar: resolveEVMRandomness(randomnessId)
-     *   3. Pass the returned encoded bytes here
-     *   4. Send updateFee() worth of MON as msg.value
-     *
-     * @param encodedRandomness  encoded payload from Switchboard Crossbar
-     */
     function fulfillDraw(bytes calldata encodedRandomness) external payable {
         if (state != State.DrawRequested) revert WrongState(state);
 
-        // Get required fee
         uint256 fee = switchboard.updateFee();
         if (msg.value < fee) revert InsufficientFee(msg.value, fee);
 
-        // Settle — Switchboard verifies TEE proof onchain, reverts if invalid
-        switchboard.settleRandomness{value: fee}(encodedRandomness);
+        try switchboard.settleRandomness{value: fee}(encodedRandomness) {
+            // settlement succeeded
+        } catch Error(string memory reason) {
+            revert SettlementFailedString(reason);
+        } catch (bytes memory reason) {
+            revert SettlementFailedBytes(reason);
+        }
 
-        // Read verified result
         ISwitchboard.RandomnessData memory data = switchboard.getRandomness(randomnessId);
-        if (data.settledAt == 0) revert RandomnessNotResolved();
 
-        // Map result to ticket index [0, totalTickets) then binary search
+        if (data.randId != randomnessId) revert RandomnessIdMismatch(randomnessId, data.randId);
+        if (data.settledAt == 0) revert RandomnessNotResolved();
+        if (totalTickets == 0) revert InvalidSnapshot();
+
         winningTicket = data.value % totalTickets;
-        address w     = _findWinner(winningTicket);
-        winner        = w;
+        winner        = _findWinner(winningTicket);
         state         = State.Complete;
 
-        emit DrawComplete(w, winningTicket, totalTickets);
+        emit DrawComplete(winner, winningTicket, totalTickets, randomnessId, data.value);
 
-        // Refund excess MON
         uint256 excess = msg.value - fee;
         if (excess > 0) {
             (bool ok,) = msg.sender.call{value: excess}("");
-            if (!ok) revert RefundFailed();
+            if (!ok) emit ExcessRefundFailed(msg.sender, excess);
         }
-
-        // Transfer prize NFT to winner atomically in same tx
-        IERC721(prizeNFT).safeTransferFrom(address(this), w, prizeTokenId);
     }
 
-    // ── Emergency ──────────────────────────────────────────────────────────────
+    function claimPrize() external onlyWinnerOrOwner {
+        if (state != State.Complete) revert WrongState(state);
+        if (!prizeDeposited) revert PrizeNotDeposited();
+        if (prizeClaimed) revert PrizeAlreadyClaimed();
 
-    /**
-     * @notice Recover prize NFT if the raffle needs to be cancelled.
-     *         Cannot be called after the draw is complete.
-     *         Resets to SnapshotLoaded state so a new prize can be deposited.
-     */
-    function recoverPrize() external onlyOwner {
-        require(state != State.Complete, "Raffle already complete");
-        require(prizeDeposited, "No prize deposited");
-
-        address nft    = prizeNFT;
-        uint256 tid    = prizeTokenId;
-
-        // Clear prize + stale randomness state
+        prizeClaimed   = true;
         prizeDeposited = false;
-        prizeNFT       = address(0);
-        prizeTokenId   = 0;
-        randomnessId   = bytes32(0);
-        drawDeadline   = 0;
-        state          = State.SnapshotLoaded;
+
+        emit PrizeClaimed(winner, prizeNFT, prizeTokenId);
+        IERC721(prizeNFT).safeTransferFrom(address(this), winner, prizeTokenId);
+    }
+
+    function recoverPrize() external onlyOwner {
+        require(state != State.Complete, "Draw already complete");
+        if (!prizeDeposited) revert PrizeNotDeposited();
+
+        address nft = prizeNFT;
+        uint256 tid = prizeTokenId;
+
+        prizeDeposited         = false;
+        prizeClaimed           = false;
+        prizeNFT               = address(0);
+        prizeTokenId           = 0;
+        randomnessId           = bytes32(0);
+        drawDeadline           = 0;
+        drawOracle             = address(0);
+        drawRollTimestamp      = 0;
+        drawMinSettlementDelay = 0;
+        drawRequestFee         = 0;
+
+        state = State.SnapshotLoaded;
 
         emit PrizeRecovered(owner);
         IERC721(nft).safeTransferFrom(address(this), owner, tid);
     }
 
-    // ── Views ──────────────────────────────────────────────────────────────────
-
-    /// @dev Upper-bound binary search on cumTickets array — O(log n)
     function _findWinner(uint256 ticketIndex) internal view returns (address) {
         uint256 lo = 0;
         uint256 hi = cumTickets.length - 1;
+
         while (lo < hi) {
             uint256 mid = (lo + hi) / 2;
             if (cumTickets[mid] <= ticketIndex) {
@@ -343,18 +313,29 @@ contract R3tardsRaffle is IERC721Receiver {
                 hi = mid;
             }
         }
+
         return wallets[lo];
     }
 
-    /**
-     * @notice Returns a wallet's ticket range [from, to] inclusive.
-     *         Use this to verify a specific wallet's allocation matches the snapshot.
-     *         Returns found=false if wallet is not in snapshot (no revert).
-     */
-    function getWalletTickets(address wallet)
-        external view
-        returns (uint256 from, uint256 to, bool found)
-    {
+    function getResolverParams() external view returns (
+        uint256 chainId,
+        bytes32 _randomnessId,
+        address oracle,
+        uint256 rollTimestamp,
+        uint64 minSettlementDelay,
+        uint256 fee
+    ) {
+        return (
+            block.chainid,
+            randomnessId,
+            drawOracle,
+            drawRollTimestamp,
+            drawMinSettlementDelay,
+            switchboard.updateFee()
+        );
+    }
+
+    function getWalletTickets(address wallet) external view returns (uint256 from, uint256 to, bool found) {
         for (uint256 i = 0; i < wallets.length; i++) {
             if (wallets[i] == wallet) {
                 from  = i == 0 ? 0 : cumTickets[i - 1];
@@ -366,7 +347,6 @@ contract R3tardsRaffle is IERC721Receiver {
         return (0, 0, false);
     }
 
-    /// @notice Full raffle state in one call — for frontends and explorers
     function getRaffleInfo() external view returns (
         uint256 _totalTickets,
         uint256 _walletCount,
@@ -375,10 +355,12 @@ contract R3tardsRaffle is IERC721Receiver {
         address _prizeNFT,
         uint256 _prizeTokenId,
         uint256 _drawDeadline,
-        State   _state,
+        State _state,
         bytes32 _randomnessId,
         address _winner,
-        uint256 _winningTicket
+        uint256 _winningTicket,
+        bool _prizeDeposited,
+        bool _prizeClaimed
     ) {
         return (
             totalTickets,
@@ -391,11 +373,12 @@ contract R3tardsRaffle is IERC721Receiver {
             state,
             randomnessId,
             winner,
-            winningTicket
+            winningTicket,
+            prizeDeposited,
+            prizeClaimed
         );
     }
 
-    /// @notice Returns Switchboard settlement fee — send this as msg.value to fulfillDraw()
     function getRequiredFee() external view returns (uint256) {
         return switchboard.updateFee();
     }
