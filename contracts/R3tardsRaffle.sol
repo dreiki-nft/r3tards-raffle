@@ -59,8 +59,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
     /// @notice Pyth default provider on Monad Mainnet
     address public constant ENTROPY_PROVIDER = 0x52DeaA1c84233F7bb8C8A45baeDE41091c616506;
 
-    /// @notice Gas limit for Pyth callback — covers _findWinner loop for large snapshots
-    uint32 public constant CALLBACK_GAS_LIMIT = 500_000;
+    /// @notice Team wallets — cannot deposit prize OR win
     address public constant DEPLOYER           = 0x40Ea55E0b8f02f8eBc9D91e082e202ed988647fA;
     address public constant COMMUNITY_TREASURY = 0xdfC19DD5f80048dF12D7a71cB01226F8ce24a954;
     address public constant ACTIVATION         = 0x18D5346216315667C51D69F346E3C768136F8018;
@@ -122,6 +121,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
     error DeadlineNotSet();
     error PrizeAlreadyClaimed();
     error PrizeNotDeposited();
+    error PrizeNotClaimed();
     error NoEligibleWinner();
     error NotAuthorizedDepositor();
     error ZeroTicketEntry();
@@ -164,7 +164,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
      */
     function reset() external onlyOwner {
         if (state != State.Complete) revert WrongState(state);
-        require(!prizeDeposited, "Prize not yet claimed");
+        if (prizeDeposited) revert PrizeNotClaimed();
 
         state = State.Pending;
     }
