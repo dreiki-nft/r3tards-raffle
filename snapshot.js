@@ -5,19 +5,17 @@
  *
  * Ticket rules:
  *   1 r3tard NFT        = 1 ticket  (ALL NFT holders included)
- *   1 r3tard SBT        = 2 tickets (tier 2 in airdrop_final.csv)
- *   1 Diamond Hand SBT  = 3 tickets (tier 1 in airdrop_final.csv)
- *   certified j33t SBT  = 0 tickets (tier 3 in airdrop_final.csv)
+ *   Diamond Hand SBT    = +3 tickets (tier 1 in airdrop_final.csv)
+ *   r3tard SBT          = +2 tickets (tier 2 in airdrop_final.csv)
+ *   certified j33t SBT  = +0 tickets (tier 3)
  *   Tickets stack.
  *
- * Steps:
- *   1. Scan Transfer events to find ALL current NFT holders
- *   2. Load airdrop_final.csv for SBT bonuses
- *   3. Merge — every NFT holder gets tickets, SBT holders get bonuses on top
+ * Method: ownerOf(tokenId) for each tokenId 1..totalSupply
+ * This finds ALL current holders regardless of SBT status.
  *
  * Usage:
  *   node snapshot.js --rpc https://rpc.monad.xyz --block 69612284 \
- *     --from 66677485 --airdrop airdrop_final.csv --out snapshot_final.csv
+ *     --supply 1033 --airdrop airdrop_final.csv --out snapshot_final.csv
  */
 
 'use strict';
@@ -26,8 +24,7 @@ const https = require('https');
 const http  = require('http');
 const fs    = require('fs');
 
-const NFT_ADDR     = '0x200723A706de0013316E5cd8EBa2b3f53DD90c29';
-const TRANSFER_SIG = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const NFT_ADDR = '0x200723A706de0013316E5cd8EBa2b3f53DD90c29';
 
 const args = process.argv.slice(2);
 function arg(flag, def) {
@@ -37,13 +34,11 @@ function arg(flag, def) {
 
 const RPC_URL      = arg('--rpc',     'https://rpc.monad.xyz');
 const BLOCK_RAW    = arg('--block',   'latest');
-const FROM_BLOCK   = arg('--from',    '66677485'); // r3tards deployment block
+const TOTAL_SUPPLY = parseInt(arg('--supply', '1033'), 10);
 const AIRDROP_FILE = arg('--airdrop', 'airdrop_final.csv');
 const OUT_FILE     = arg('--out',     'snapshot_final.csv');
-const CHUNK_SIZE   = parseInt(arg('--chunk', '2000'), 10);
 
 const BLOCK_HEX = BLOCK_RAW === 'latest' ? 'latest' : '0x' + parseInt(BLOCK_RAW).toString(16);
-const FROM_HEX  = '0x' + parseInt(FROM_BLOCK).toString(16);
 
 // ─── RPC ──────────────────────────────────────────────────────────────────────
 let _id = 1;
@@ -77,87 +72,23 @@ function rpc(method, params) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ─── Fetch Transfer logs with chunking ────────────────────────────────────────
-async function fetchAllTransfers(fromBlock, toBlock) {
-  const transfers = [];
-  let from = parseInt(fromBlock, 16);
-  const to = toBlock === 'latest'
-    ? parseInt(await rpc('eth_blockNumber', []), 16)
-    : parseInt(toBlock, 16);
-
-  let chunk = CHUNK_SIZE;
-
-  while (from <= to) {
-    const end = Math.min(from + chunk - 1, to);
-    const fromHex = '0x' + from.toString(16);
-    const endHex  = '0x' + end.toString(16);
-
-    try {
-      process.stdout.write(`\r  scanning blocks ${from}–${end}...          `);
-      const logs = await rpc('eth_getLogs', [{
-        address:   NFT_ADDR,
-        topics:    [TRANSFER_SIG],
-        fromBlock: fromHex,
-        toBlock:   endHex,
-      }]);
-
-      for (const log of logs) {
-        const from_addr = '0x' + log.topics[1].slice(26).toLowerCase();
-        const to_addr   = '0x' + log.topics[2].slice(26).toLowerCase();
-        const tokenId   = parseInt(log.topics[3], 16);
-        transfers.push({ from: from_addr, to: to_addr, tokenId });
-      }
-
-      from = end + 1;
-      chunk = Math.min(chunk * 2, CHUNK_SIZE); // grow back after success
-    } catch(e) {
-      if (e.message.includes('range') || e.message.includes('limit') || e.message.includes('too large')) {
-        chunk = Math.max(Math.floor(chunk / 2), 1);
-        process.stdout.write(`\n  [warn] range too large, halving chunk to ${chunk}\n`);
-      } else {
-        throw e;
-      }
-    }
-  }
-
-  console.log(`\n  found ${transfers.length} transfer events`);
-  return transfers;
+// ownerOf(uint256) selector: 0x6352211e
+function encodeOwnerOf(tokenId) {
+  return '0x6352211e' + tokenId.toString(16).padStart(64, '0');
 }
 
-// ─── Build current holders from transfer history ──────────────────────────────
-function buildHolders(transfers) {
-  const holders = new Map(); // tokenId → owner
-
-  for (const { from, to, tokenId } of transfers) {
-    if (from === '0x' + '0'.repeat(40)) {
-      // mint
-      holders.set(tokenId, to);
-    } else {
-      holders.set(tokenId, to);
-    }
-  }
-
-  // Count per wallet
-  const counts = new Map();
-  for (const owner of holders.values()) {
-    counts.set(owner, (counts.get(owner) || 0) + 1);
-  }
-
-  return counts; // Map<wallet, nftCount>
-}
-
-// ─── balanceOf verification ───────────────────────────────────────────────────
-async function verifyBalance(wallet) {
-  const data = '0x70a08231' + wallet.replace('0x', '').padStart(64, '0');
-  for (let attempt = 1; attempt <= 5; attempt++) {
+async function getOwner(tokenId, retries = 5) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const result = await rpc('eth_call', [{ to: NFT_ADDR, data }, BLOCK_HEX]);
-      if (!result || result === '0x') return 0;
-      const bal = parseInt(result, 16);
-      return isNaN(bal) ? 0 : bal;
+      const result = await rpc('eth_call', [{
+        to:   NFT_ADDR,
+        data: encodeOwnerOf(tokenId),
+      }, BLOCK_HEX]);
+      if (!result || result === '0x') return null;
+      return '0x' + result.slice(26).toLowerCase();
     } catch(e) {
-      if (attempt === 5) {
-        console.error(`\n[error] balanceOf failed for ${wallet}: ${e.message}`);
+      if (attempt === retries) {
+        console.error(`\n[error] ownerOf(${tokenId}) failed after ${retries} attempts: ${e.message}`);
         process.exit(1);
       }
       await sleep(500 * attempt);
@@ -189,76 +120,58 @@ function loadAirdrop(file) {
 // ─── Main ─────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('\n╔══════════════════════════════════════════╗');
-  console.log('║     r3tards snapshot — full holder scan  ║');
+  console.log('║     r3tards snapshot — ownerOf mode      ║');
   console.log('╚══════════════════════════════════════════╝\n');
   console.log(`RPC:            ${RPC_URL}`);
   console.log(`Snapshot block: ${BLOCK_RAW}`);
-  console.log(`From block:     ${FROM_BLOCK}`);
+  console.log(`Total supply:   ${TOTAL_SUPPLY}`);
   console.log(`Airdrop file:   ${AIRDROP_FILE}`);
   console.log(`Output:         ${OUT_FILE}\n`);
 
-  // Step 1: Scan Transfer events
-  console.log('Step 1: Scanning Transfer events...');
-  const transfers = await fetchAllTransfers(FROM_HEX, BLOCK_HEX);
+  // Step 1: Load SBT airdrop
+  console.log('Step 1: Loading SBT airdrop data...');
+  const airdrop = loadAirdrop(AIRDROP_FILE);
+  console.log(`  ${airdrop.size} SBT holders loaded\n`);
 
-  // Step 2: Build holder list from transfers
-  console.log('\nStep 2: Building holder list from transfers...');
-  const transferHolders = buildHolders(transfers);
-  console.log(`  ${transferHolders.size} unique holders from transfer history`);
+  // Step 2: ownerOf for each tokenId 1..totalSupply
+  console.log(`Step 2: Fetching owner of each tokenId (1–${TOTAL_SUPPLY}) sequentially...`);
+  const nftCounts = new Map(); // wallet → nft count
 
-  // Step 3: Verify each holder's balance via balanceOf (sequential, no mixing)
-  console.log('\nStep 3: Verifying balances via balanceOf (sequential)...');
-  const holderList = [...transferHolders.keys()];
-  const verifiedHolders = new Map();
-  let checked = 0;
-
-  for (const wallet of holderList) {
-    const bal = await verifyBalance(wallet);
-    if (bal > 0) verifiedHolders.set(wallet, bal);
-    checked++;
-    if (checked % 50 === 0 || checked === holderList.length) {
-      process.stdout.write(`\r  ${checked}/${holderList.length} verified (${verifiedHolders.size} with balance)...`);
+  for (let tokenId = 1; tokenId <= TOTAL_SUPPLY; tokenId++) {
+    const owner = await getOwner(tokenId);
+    if (owner && owner !== '0x' + '0'.repeat(40)) {
+      nftCounts.set(owner, (nftCounts.get(owner) || 0) + 1);
+    }
+    if (tokenId % 50 === 0 || tokenId === TOTAL_SUPPLY) {
+      process.stdout.write(`\r  ${tokenId}/${TOTAL_SUPPLY} tokens checked (${nftCounts.size} unique holders)...`);
     }
   }
-  console.log(`\n  ${verifiedHolders.size} wallets with NFTs at snapshot block`);
+  console.log(`\n  ${nftCounts.size} unique NFT holders found\n`);
 
-  // Step 4: Load SBT airdrop
-  console.log('\nStep 4: Loading SBT airdrop data...');
-  const airdrop = loadAirdrop(AIRDROP_FILE);
-  console.log(`  ${airdrop.size} SBT holders loaded`);
-
-  // Step 5: Merge — all NFT holders get tickets, SBT holders get bonus
-  console.log('\nStep 5: Computing tickets...');
+  // Step 3: Compute tickets
+  console.log('Step 3: Computing tickets...');
   const rows = [];
   let totalTickets = 0;
   let skipped = 0;
 
-  for (const [wallet, nftBalance] of verifiedHolders) {
-    const tier = airdrop.get(wallet) || '0'; // '0' = no SBT
-
+  // All NFT holders
+  for (const [wallet, nftBalance] of nftCounts) {
+    const tier = airdrop.get(wallet) || '0';
     let sbtTickets = 0;
     if (tier === '1') sbtTickets = 3;
     else if (tier === '2') sbtTickets = 2;
-    // tier 3 (j33t) = 0, tier 0 (no SBT) = 0
 
-    const nftTickets     = nftBalance;
-    const totalForWallet = sbtTickets + nftTickets;
-
-    if (totalForWallet === 0) { skipped++; continue; }
-
-    rows.push({ wallet, tier, nftBalance, sbtTickets, nftTickets, tickets: totalForWallet });
+    const totalForWallet = sbtTickets + nftBalance;
+    rows.push({ wallet, tier, nftBalance, sbtTickets, nftTickets: nftBalance, tickets: totalForWallet });
     totalTickets += totalForWallet;
   }
 
-  // Also add SBT holders who somehow have 0 NFTs but positive SBT tickets
-  // (j33ts with no NFTs are already skipped, Diamond/r3tard with no NFTs get SBT tickets)
+  // SBT holders with 0 NFTs (Diamond Hand / r3tard SBT but no NFT)
   for (const [wallet, tier] of airdrop) {
-    if (verifiedHolders.has(wallet)) continue; // already handled above
-
+    if (nftCounts.has(wallet)) continue; // already handled
     let sbtTickets = 0;
     if (tier === '1') sbtTickets = 3;
     else if (tier === '2') sbtTickets = 2;
-
     if (sbtTickets === 0) { skipped++; continue; }
 
     rows.push({ wallet, tier, nftBalance: 0, sbtTickets, nftTickets: 0, tickets: sbtTickets });
