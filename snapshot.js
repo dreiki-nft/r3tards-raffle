@@ -37,7 +37,7 @@ const RPC_URL      = arg('--rpc',     'https://rpc.monad.xyz');
 const BLOCK_RAW    = arg('--block',   'latest');
 const AIRDROP_FILE = arg('--airdrop', 'airdrop_final.csv');
 const OUT_FILE     = arg('--out',     'snapshot_final.csv');
-const CONCURRENCY  = parseInt(arg('--concurrency', '20'), 10);
+const CONCURRENCY  = parseInt(arg('--concurrency', '5'), 10);
 
 const BLOCK = BLOCK_RAW === 'latest' ? 'latest' : '0x' + parseInt(BLOCK_RAW).toString(16);
 
@@ -83,7 +83,10 @@ async function getBalance(wallet, retries = 5) {
         to:   NFT_ADDR,
         data: encodeBalanceOf(wallet),
       }, BLOCK]);
-      return parseInt(result, 16) || 0;
+      if (!result || result === '0x') return 0;
+      const bal = parseInt(result, 16);
+      if (isNaN(bal)) return 0;
+      return bal;
     } catch(e) {
       if (attempt === retries) {
         console.error(`\n[error] Failed to get balance for ${wallet} after ${retries} attempts: ${e.message}`);

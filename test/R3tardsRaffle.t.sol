@@ -658,4 +658,83 @@ contract R3tardsRaffleTest is Test {
         assertEq(raffle.winner(), CHARLIE);
     }
 
+    // ─── reset ────────────────────────────────────────────────────────────────
+
+    function test_reset_succeedsAfterComplete() public {
+        _setupFullRaffle();
+        _fireCallback(keccak256("randomness"));
+        raffle.fulfillDraw();
+
+        // claim prize first
+        address w = raffle.winner();
+        vm.prank(w);
+        raffle.claimPrize();
+
+        // now reset
+        vm.prank(DEPLOYER);
+        raffle.reset();
+        assertEq(uint8(raffle.state()), 0); // Pending
+    }
+
+    function test_reset_revertsIfPrizeNotClaimed() public {
+        _setupFullRaffle();
+        _fireCallback(keccak256("randomness"));
+        raffle.fulfillDraw();
+
+        // don't claim prize — try to reset
+        vm.prank(DEPLOYER);
+        vm.expectRevert(R3tardsRaffle.PrizeNotClaimed.selector);
+        raffle.reset();
+    }
+
+    function test_reset_revertsIfNotComplete() public {
+        _setupFullRaffle();
+
+        vm.prank(DEPLOYER);
+        vm.expectRevert();
+        raffle.reset();
+    }
+
+    function test_reset_allowsNewRaffle() public {
+        _setupFullRaffle();
+        _fireCallback(keccak256("randomness"));
+        raffle.fulfillDraw();
+
+        address w = raffle.winner();
+        vm.prank(w);
+        raffle.claimPrize();
+
+        vm.prank(DEPLOYER);
+        raffle.reset();
+
+        // start new raffle
+        vm.prank(DEPLOYER);
+        raffle.initSnapshot(999, keccak256("new raffle"));
+        assertEq(uint8(raffle.state()), 1); // LoadingSnapshot
+        assertEq(raffle.snapshotBlock(), 999);
+    }
+
+
+
+    function test_stateMachine_cannotSkipStates() public {
+        address[] memory ws = new address[](1);
+        ws[0] = ALICE;
+        uint256[] memory ts = new uint256[](1);
+        ts[0] = 1;
+
+        vm.startPrank(DEPLOYER);
+        vm.expectRevert();
+        raffle.loadTicketsBatch(ws, ts);
+
+        vm.expectRevert();
+        raffle.finalizeSnapshot();
+
+        raffle.initSnapshot(100, keccak256("hash"));
+        raffle.loadTicketsBatch(ws, ts);
+        raffle.finalizeSnapshot();
+
+        vm.expectRevert();
+        raffle.requestDraw{value: 0.6 ether}(keccak256("random"));
+        vm.stopPrank();
+    }
 }
