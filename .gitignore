@@ -1,6 +1,3 @@
 node_modules/
 *.csv
 .env
-out/
-cache/
-foundry.lock

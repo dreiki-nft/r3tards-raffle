@@ -156,6 +156,19 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
             || addr == TEAM_LOCK;
     }
 
+    // ─── Reset ────────────────────────────────────────────────────────────────
+
+    /**
+     * @notice Resets the contract to Pending state for a new raffle.
+     *         Can only be called after a raffle is Complete AND prize is claimed.
+     */
+    function reset() external onlyOwner {
+        if (state != State.Complete) revert WrongState(state);
+        require(!prizeDeposited, "Prize not yet claimed");
+
+        state = State.Pending;
+    }
+
     // ─── Step 1a: Init snapshot ───────────────────────────────────────────────
 
     function initSnapshot(uint256 _snapshotBlock, bytes32 _snapshotHash) external onlyOwner {
