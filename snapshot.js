@@ -37,7 +37,7 @@ const RPC_URL      = arg('--rpc',     'https://rpc.monad.xyz');
 const BLOCK_RAW    = arg('--block',   'latest');
 const AIRDROP_FILE = arg('--airdrop', 'airdrop_final.csv');
 const OUT_FILE     = arg('--out',     'snapshot_final.csv');
-const CONCURRENCY  = parseInt(arg('--concurrency', '5'), 10);
+const CONCURRENCY  = parseInt(arg('--concurrency', '1'), 10);
 
 const BLOCK = BLOCK_RAW === 'latest' ? 'latest' : '0x' + parseInt(BLOCK_RAW).toString(16);
 
