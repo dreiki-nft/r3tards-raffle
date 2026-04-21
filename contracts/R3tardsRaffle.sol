@@ -148,7 +148,7 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
 
     // ─── Internal helpers ─────────────────────────────────────────────────────
 
-    function _isTeamWallet(address addr) internal pure returns (bool) {
+    function _isTeamWallet(address addr) public pure returns (bool) {
         return addr == DEPLOYER
             || addr == COMMUNITY_TREASURY
             || addr == ACTIVATION
