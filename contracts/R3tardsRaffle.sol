@@ -162,6 +162,32 @@ contract R3tardsRaffle is IERC721Receiver, IEntropyConsumer {
      * @notice Resets the contract to Pending state for a new raffle.
      *         Can only be called after a raffle is Complete AND prize is claimed.
      */
+    /**
+     * @notice Emergency reset — forces contract back to Pending from any state.
+     *         Only use if raffle is stuck. NFT must be manually recovered separately.
+     *         onlyOwner.
+     */
+    function emergencyReset() external onlyOwner {
+        delete wallets;
+        delete cumTickets;
+
+        totalTickets    = 0;
+        snapshotBlock   = 0;
+        snapshotHash    = bytes32(0);
+        prizeNFT        = address(0);
+        prizeTokenId    = 0;
+        prizeDepositor  = address(0);
+        prizeDeposited  = false;
+        prizeClaimed    = false;
+        sequenceNumber  = 0;
+        rawRandomNumber = bytes32(0);
+        drawDeadline    = 0;
+        winner          = address(0);
+        winningTicket   = 0;
+
+        state = State.Pending;
+    }
+
     function reset() external onlyOwner {
         if (state != State.Complete) revert WrongState(state);
         if (prizeDeposited) revert PrizeNotClaimed();
